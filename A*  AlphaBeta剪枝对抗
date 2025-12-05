@@ -1,0 +1,681 @@
+import numpy as np
+import copy
+import heapq
+import time
+from collections import defaultdict
+
+# ==========================================
+# I. 统一比赛环境 (RoboconEnvironment)
+# ==========================================
+
+class RoboconEnvironment:
+    """
+    统一的比赛环境。用于 AlphaBetaBot 和 AStarBot 之间的数据交互。
+    玩家 1 (Max/A* Bot) 使用 +1，玩家 -1 (Min/AlphaBeta Bot) 使用 -1。
+    """
+    def __init__(self, initial_board=None, initial_r1=5, initial_r2=5, initial_weapons=3, time_limit=180.0):
+        # 棋盘结构: 3x3x2 数组 (Owner/Type)
+        # board[r, c, 0] = Owner (1:P1, -1:P2, 0:Empty)
+        # board[r, c, 1] = Type (1:R1-KFS, 2:R2-KFS, 0:Empty)
+        if initial_board is None:
+            self.board = np.zeros((3, 3, 2), dtype=int)
+        else:
+            self.board = initial_board.copy()
+            
+        # 资源
+        self.r1_kfs = {1: initial_r1, -1: initial_r1}
+        self.r2_kfs = {1: initial_r2, -1: initial_r2}
+        self.weapons = {1: initial_weapons, -1: initial_weapons}
+        
+        # 成本/时间
+        self.costs = {1: 0.0, -1: 0.0}
+        self.time_limit = time_limit
+        
+        # 当前玩家
+        self.current_player = 1
+        self.game_over = False
+        self.winner = 0  # 1: P1 win, -1: P2 win, 0: Draw
+        
+        # 动作时间 (简化Robocon模型)
+        self.T_PLACE = {
+            0: 8.0,  # 顶层
+            1: 5.0,  # 中层
+            2: 5.0   # 底层
+        }
+        self.T_ATTACK = 6.0
+        self.P_FAIL_PLACE = 0.1
+        self.P_FAIL_ATTACK = 0.2
+
+    def clone(self):
+        new_env = RoboconEnvironment(
+            initial_board=self.board, 
+            initial_r1=self.r1_kfs[1], 
+            initial_r2=self.r2_kfs[1], 
+            initial_weapons=self.weapons[1],
+            time_limit=self.time_limit
+        )
+        new_env.r1_kfs = self.r1_kfs.copy()
+        new_env.r2_kfs = self.r2_kfs.copy()
+        new_env.weapons = self.weapons.copy()
+        new_env.costs = self.costs.copy()
+        new_env.current_player = self.current_player
+        new_env.game_over = self.game_over
+        new_env.winner = self.winner
+        return new_env
+
+    def _get_cost(self, action_type, pos=None):
+        """计算动作的风险加权成本"""
+        if action_type == 'place':
+            r = pos[0]
+            cost_time = self.T_PLACE.get(r, 5.0)
+            return cost_time / (1.0 - self.P_FAIL_PLACE)
+        elif action_type == 'attack':
+            return self.T_ATTACK / (1.0 - self.P_FAIL_ATTACK)
+        return 0.0
+
+    def get_valid_actions(self):
+        actions = []
+        # 检查当前玩家的时间是否耗尽
+        if self.game_over or self.costs[self.current_player] >= self.time_limit:
+            return actions
+
+        player = self.current_player
+        
+        # --- 放置动作 ---
+        for r in range(3):
+            for c in range(3):
+                if self.board[r, c, 0] == 0:
+                    pos = (r, c)
+                    # 放置 R1-KFS (Type 1)
+                    if self.r1_kfs[player] > 0:
+                        actions.append({
+                            'type': 'place', 'kfs_type': 1, 'pos': pos, 'player': player
+                        })
+                    # 放置 R2-KFS (Type 2)
+                    if self.r2_kfs[player] > 0:
+                        actions.append({
+                            'type': 'place', 'kfs_type': 2, 'pos': pos, 'player': player
+                        })
+        
+        # --- 攻击动作 ---
+        if self.weapons[player] > 0:
+            for r in range(3):
+                for c in range(3):
+                    # 攻击对方的棋子
+                    if self.board[r, c, 0] == -player:
+                        pos = (r, c)
+                        actions.append({
+                            'type': 'attack', 'pos': pos, 'player': player
+                        })
+        
+        return actions
+
+    def step(self, action):
+        """执行一个动作"""
+        action_type = action['type']
+        pos = action['pos']
+        player = action['player']
+        
+        cost = self._get_cost(action_type, pos)
+        
+        if action_type == 'place':
+            kfs_type = action['kfs_type']
+            self.board[pos[0], pos[1], 0] = player
+            self.board[pos[0], pos[1], 1] = kfs_type
+            if kfs_type == 1:
+                self.r1_kfs[player] -= 1
+            else:
+                self.r2_kfs[player] -= 1
+        
+        elif action_type == 'attack':
+            self.board[pos[0], pos[1], 0] = 0
+            self.board[pos[0], pos[1], 1] = 0
+            self.weapons[player] -= 1
+        
+        self.costs[player] += cost
+        
+        # 检查游戏是否结束 (只需要检查绝对胜利)
+        self._check_grand_master_win()
+        
+        # 切换玩家 (在 duel 模拟器中判断是否跳过)
+        if not self.game_over:
+            self.current_player = -self.current_player
+
+    def _get_score(self, player):
+        """计算指定玩家的得分"""
+        score = 0
+        for r in range(3):
+            for c in range(3):
+                if self.board[r, c, 0] == player:
+                    kfs_type = self.board[r, c, 1]
+                    
+                    # R1 (type 1): 40/60/90; R2 (type 2): 50/70/100
+                    if r == 0:  # 顶层区域
+                        score += 90 if kfs_type == 1 else 100
+                    elif r == 1:  # 中层区域
+                        score += 60 if kfs_type == 1 else 70
+                    elif r == 2:  # 底层区域
+                        score += 40 if kfs_type == 1 else 50
+        return score
+    
+    def _check_grand_master(self, player):
+        """检查指定玩家是否达成绝对胜利 (三连且含R2)"""
+        
+        # 创建一个只包含 Owner 的 3x3 矩阵
+        owner_board = self.board[:, :, 0]
+        
+        # 检查所有行/列/对角线
+        for i in range(3):
+            # 检查列
+            if np.all(owner_board[:, i] == player):
+                types = self.board[:, i, 1]
+                if 2 in types: 
+                    return True
+            # 检查行
+            if np.all(owner_board[i, :] == player):
+                types = self.board[i, :, 1]
+                if 2 in types: 
+                    return True
+        
+        # 检查对角线
+        diag1_owner = owner_board.diagonal()
+        diag2_owner = np.fliplr(owner_board).diagonal()
+        
+        if np.all(diag1_owner == player):
+            types = self.board.diagonal()[:, 1]
+            if 2 in types: 
+                return True
+            
+        if np.all(diag2_owner == player):
+            # 直接从原始 board 中抽取反向对角线类型
+            types = np.array([self.board[i, 2-i, 1] for i in range(3)]) 
+            if 2 in types: 
+                return True
+            
+        return False
+    
+    def _check_grand_master_win(self):
+        """检查绝对胜利，并设置 game_over/winner"""
+        # 1. 绝对胜利检查 (Robocon 终局规则)
+        if self._check_grand_master(1):
+            self.game_over = True
+            self.winner = 1
+            return
+        if self._check_grand_master(-1):
+            self.game_over = True
+            self.winner = -1
+            return
+            
+    def _get_game_end_score_winner(self):
+        """游戏结束时，根据分数判断胜者"""
+        self.game_over = True
+        score_p1 = self._get_score(1)
+        score_p2 = self._get_score(-1)
+        
+        if score_p1 > score_p2:
+            self.winner = 1
+        elif score_p2 > score_p1:
+            self.winner = -1
+        else:
+            self.winner = 0  # 平局
+
+    def get_valid_actions_no_time_check(self, player):
+        """用于判断游戏是否结束时，检查资源是否耗尽。返回实际的动作列表。"""
+        actions = []
+        # --- 放置动作 ---
+        for r in range(3):
+            for c in range(3):
+                if self.board[r, c, 0] == 0:
+                    pos = (r, c)
+                    if self.r1_kfs[player] > 0: 
+                        actions.append({'type': 'place', 'kfs_type': 1, 'pos': pos, 'player': player})
+                    if self.r2_kfs[player] > 0: 
+                        actions.append({'type': 'place', 'kfs_type': 2, 'pos': pos, 'player': player})
+        
+        # --- 攻击动作 ---
+        if self.weapons[player] > 0:
+            for r in range(3):
+                for c in range(3):
+                    if self.board[r, c, 0] == -player:
+                        actions.append({'type': 'attack', 'pos': (r, c), 'player': player})
+
+        return actions
+    
+    def display(self):
+        """显示当前游戏状态"""
+        print("\n" + "="*40)
+        print("当前游戏状态:")
+        print(f"当前玩家: {'Player 1' if self.current_player == 1 else 'Player -1'}")
+        print(f"游戏结束: {self.game_over}, 胜利者: {self.winner}")
+        print(f"时间消耗: P1={self.costs[1]:.1f}s, P-1={self.costs[-1]:.1f}s")
+        print(f"资源: P1 R1={self.r1_kfs[1]}, R2={self.r2_kfs[1]}, 武器={self.weapons[1]}")
+        print(f"资源: P-1 R1={self.r1_kfs[-1]}, R2={self.r2_kfs[-1]}, 武器={self.weapons[-1]}")
+        
+        print("\n棋盘 (所有者:类型):")
+        print("  " + "-" * 19)
+        for r in range(3):
+            row_str = "  |"
+            for c in range(3):
+                owner = self.board[r, c, 0]
+                kfs_type = self.board[r, c, 1]
+                if owner == 1:
+                    symbol = f"P1:{kfs_type}"
+                elif owner == -1:
+                    symbol = f"P-1:{kfs_type}"
+                else:
+                    symbol = "   "
+                row_str += f" {symbol:4s} |"
+            print(row_str)
+            print("  " + "-" * 19)
+        print(f"得分: P1={self._get_score(1)}, P-1={self._get_score(-1)}")
+        print("="*40)
+
+# ==========================================
+# II. AlphaBeta Bot (Player -1)
+# ==========================================
+
+class AlphaBetaBot:
+    def __init__(self, depth=3):
+        self.search_depth = depth
+
+    def get_best_move(self, env):
+        actions = env.get_valid_actions()
+        if not actions:
+            return None
+
+        best_val = float('inf')  # AlphaBetaBot 扮演 Player -1 (Min)
+        best_action = None
+
+        # 根节点遍历
+        is_maximizing = True  # 因为下一步是对方(P1)走
+
+        for action in actions:
+            next_env = env.clone()
+            next_env.step(action)
+            
+            # 递归搜索
+            val = self._alpha_beta(next_env, self.search_depth - 1, -float('inf'), float('inf'), is_maximizing)
+            
+            if val < best_val:
+                best_val = val
+                best_action = action
+
+        return best_action
+
+    def _alpha_beta(self, env, depth, alpha, beta, is_maximizing):
+        # --- 1. 终止条件 ---
+        if depth == 0 or env.game_over:
+            return self._evaluate(env)
+
+        # 修正: 检查当前玩家是否还有合法动作（在时间限制内）
+        actions = env.get_valid_actions()
+        if not actions: 
+            # 如果当前玩家无动作，直接评估当前状态
+            return self._evaluate(env)
+
+        # --- 2. 递归搜索 ---
+        if is_maximizing:  # Player 1 (Max)
+            max_eval = -float('inf')
+            for action in actions:
+                next_env = env.clone()
+                next_env.step(action)
+                eval_val = self._alpha_beta(next_env, depth - 1, alpha, beta, False)
+                max_eval = max(max_eval, eval_val)
+                alpha = max(alpha, eval_val)
+                if beta <= alpha:
+                    break
+            return max_eval
+        else:  # Player -1 (Min)
+            min_eval = float('inf')
+            for action in actions:
+                next_env = env.clone()
+                next_env.step(action)
+                eval_val = self._alpha_beta(next_env, depth - 1, alpha, beta, True)
+                min_eval = min(min_eval, eval_val)
+                beta = min(beta, eval_val)
+                if beta <= alpha:
+                    break
+            return min_eval
+
+    def _evaluate(self, env):
+        """ 静态评估函数：正分 -> P1 有利；负分 -> P2 (-1) 有利 """
+        P1 = 1
+        P2 = -1
+        score = 0.0
+
+        # --- A. 终局评分 (巨大奖励/惩罚) ---
+        if env.game_over:
+            # 使用一个极大的值，保证终局判定优先
+            if env.winner == P1:
+                return 1000000.0 - env.costs[P1]
+            elif env.winner == P2:
+                return -1000000.0 + env.costs[P2]
+            else:  # 平局
+                # 终局时的得分差作为平局的tie-breaker
+                return env._get_score(P1) - env._get_score(P2) 
+
+        # --- B. 过程评分 (基于 Robocon Score & 盘面优势) ---
+        
+        # 1. 实际得分优势
+        score += 1.0 * (env._get_score(P1) - env._get_score(P2))
+
+        # 2. 绝对胜利威胁
+        owner_board = env.board[:, :, 0]
+        lines = []
+        lines.extend([owner_board[:, i] for i in range(3)])  # 列
+        lines.extend([owner_board[i, :] for i in range(3)])  # 行
+        lines.append(owner_board.diagonal())                 # 对角1
+        lines.append(np.fliplr(owner_board).diagonal())      # 对角2
+
+        for line in lines:
+            cnt_p1 = np.sum(line == P1)
+            cnt_p2 = np.sum(line == P2)
+
+            if cnt_p2 == 0:
+                if cnt_p1 == 2: 
+                    score += 500.0  # P1 差一步连线
+                elif cnt_p1 == 1: 
+                    score += 50.0
+
+            if cnt_p1 == 0:
+                if cnt_p2 == 2: 
+                    score -= 500.0  # P2 差一步连线
+                elif cnt_p2 == 1: 
+                    score -= 50.0
+
+        # 3. 资源优势
+        score += 10.0 * (env.r2_kfs[P1] - env.r2_kfs[P2])
+        score += 5.0 * (env.weapons[P1] - env.weapons[P2])
+        
+        # 4. 时间劣势
+        score += (env.costs[P2] - env.costs[P1]) * 0.1
+
+        return score
+
+# ==========================================
+# III. A* Bot (Player +1)
+# ==========================================
+
+class AStarBot:
+    """
+    基于混合目标 A* 的单步决策者 (仅在单步动作中进行深度启发式评估)
+    """
+    def __init__(self):
+        # A* 核心参数
+        self.P_WIN = 1000.0  # 绝对胜利的巨大惩罚项
+        self.W_SCORE = 1.0   # 得分偏置权重
+
+    def get_best_move(self, env):
+        actions = env.get_valid_actions()
+        if not actions:
+            return None
+
+        best_f_mixed = float('inf')  # A* Bot (P1) 寻求最小的 F_mixed
+        best_action = None
+        
+        for action in actions:
+            next_env = env.clone()
+            next_env.step(action)
+            
+            # --- 转换为 GameState 方便 H(n) 计算 ---
+            temp_state = self._convert_env_to_state(next_env)
+            
+            # --- 计算 H(n) (混合启发式) ---
+            h_mixed = self._heuristic(temp_state, env)
+
+            # --- 计算 F_mixed = G(n) + H(n) ---
+            f_mixed = next_env.costs[1] + h_mixed
+            
+            if f_mixed < best_f_mixed:
+                best_f_mixed = f_mixed
+                best_action = action
+
+        return best_action
+
+    def _convert_env_to_state(self, env):
+        """将 numpy 环境转换为 A* 友好的列表结构"""
+        board_list = []
+        for r in range(3):
+            row = []
+            for c in range(3):
+                owner = env.board[r, c, 0]
+                kfs_type = env.board[r, c, 1]
+                row.append({'owner': owner, 'type': kfs_type})
+            board_list.append(row)
+            
+        return GameStateDummy(
+            board=board_list,
+            r1_kfs=env.r1_kfs[1],
+            r2_kfs=env.r2_kfs[1],
+            weapons=env.weapons[1]
+        )
+
+    def _calculate_h_gm(self, state, env):
+        """计算 H_GM: 预估达成绝对胜利所需的最小时间 (只看 P1 视角)"""
+        if env._check_grand_master(1): 
+            return 0, 0 
+
+        min_steps_needed = 9 
+        
+        # 检查所有连线
+        indices = []
+        for c in range(3): 
+            indices.append([(r, c) for r in range(3)])  # 列
+        for r in range(3): 
+            indices.append([(r, c) for c in range(3)])  # 行
+        indices.append([(i, i) for i in range(3)])
+        indices.append([(i, 2-i) for i in range(3)])
+        
+        for line_idx in indices:
+            my_count, enemy_count, r2_present = 0, 0, False
+            for r, c in line_idx:
+                cell = state.board[r][c]
+                if cell['owner'] == 1: 
+                    my_count += 1
+                    if cell['type'] == 2: 
+                        r2_present = True
+                elif cell['owner'] == -1: 
+                    enemy_count += 1
+            
+            steps = 0
+            # 攻击敌人
+            if enemy_count > 0:
+                if state.weapons >= enemy_count: 
+                    steps += enemy_count * env._get_cost('attack')
+                else: 
+                    continue  # 无法清理障碍
+            
+            # 放置所需子
+            needed_placements = 3 - my_count - enemy_count
+            if needed_placements < 0: 
+                needed_placements = 0
+            
+            # 假设所有放置都发生在代价最小的底层 (r=2)
+            steps += needed_placements * env.T_PLACE[2] 
+            
+            # 检查 R2-KFS 资源是否足够
+            r2_needed = 0
+            if needed_placements > 0 and not r2_present:
+                # 至少需要一个 R2
+                r2_needed = 1 
+            
+            if r2_needed > state.r2_kfs:
+                continue  # R2 资源不足
+                
+            # 计算总步数（简化为时间）
+            total_time = steps
+            if total_time < min_steps_needed:
+                min_steps_needed = total_time
+                
+        H_GM = min_steps_needed 
+        # 返回总耗时和简化后的步数
+        return H_GM, min_steps_needed / env.T_PLACE[2] if env.T_PLACE[2] > 0 else 9
+
+    def _heuristic(self, state, env):
+        """计算 F_mixed 的 H(n) 部分: H_GM - ScoreBias + WinBonus"""
+        H_GM, min_steps = self._calculate_h_gm(state, env)
+        
+        P_win = self.P_WIN
+        
+        # WinBonus
+        if env._check_grand_master(1):
+            win_bonus = -P_win  # 已达成
+        elif H_GM < 3 * env.T_PLACE[2]: 
+            win_bonus = -P_win + H_GM  # 预估可达成
+        else:
+            win_bonus = 0.0
+            
+        # ScoreBias
+        score_bias = self.W_SCORE * env._get_score(1)
+        
+        return H_GM - score_bias + win_bonus
+
+# --- A* 内部使用的简化状态类 ---
+class GameStateDummy:
+    """A* 内部计算 H(n) 时使用的临时状态"""
+    def __init__(self, board, r1_kfs, r2_kfs, weapons):
+        self.board = board
+        self.r1_kfs = r1_kfs
+        self.r2_kfs = r2_kfs
+        self.weapons = weapons
+
+# ==========================================
+# IV. 对抗赛模拟器 (Duel Simulator)
+# ==========================================
+
+def run_duel(bot1, bot2, num_rounds=500):
+    p1_wins = 0
+    p2_wins = 0
+    draws = 0
+
+    print(f"--- ⚔️ 开始 {num_rounds} 轮对战 (P1: A* Bot, P2: AlphaBeta Bot) ⚔️ ---")
+    
+    for i in range(1, num_rounds + 1):
+        # 每次对战重置环境
+        env = RoboconEnvironment()
+        
+        no_action_count = 0  # 跟踪连续无动作的次数
+        
+        # 轮流走
+        while not env.game_over:
+            
+            # --- 1. 获取动作 ---
+            if env.current_player == 1:
+                action = bot1.get_best_move(env)
+            else:  # Player -1
+                action = bot2.get_best_move(env)
+            
+            # --- 2. 处理无动作 (关键修复点) ---
+            if action is None:
+                no_action_count += 1
+                
+                # 检查**双方**是否都无动作 或 双方时间都耗尽
+                actions_p1 = env.get_valid_actions_no_time_check(1)
+                actions_p2 = env.get_valid_actions_no_time_check(-1)
+                
+                p1_no_valid_moves = (len(actions_p1) == 0 or env.costs[1] >= env.time_limit)
+                p2_no_valid_moves = (len(actions_p2) == 0 or env.costs[-1] >= env.time_limit)
+                
+                # 终止条件：双方都无法走棋
+                if p1_no_valid_moves and p2_no_valid_moves:
+                    env._get_game_end_score_winner()  # 根据得分决定胜负
+                    break 
+                
+                # 只有当前玩家没动作，则切换到另一个玩家继续
+                env.current_player = -env.current_player
+                
+                # 如果连续两次都没有动作，则直接根据得分判断胜负（防止无限循环）
+                if no_action_count > 2: 
+                    env._get_game_end_score_winner()
+                    break
+                
+                continue  # 进入下一轮循环，换人走
+            
+            # --- 3. 执行动作 ---
+            env.step(action)
+            no_action_count = 0  # 成功执行动作，重置计数
+
+        if env.winner == 1:
+            p1_wins += 1
+        elif env.winner == -1:
+            p2_wins += 1
+        else:
+            draws += 1
+            
+        if i % 100 == 0:
+            print(f"  [进度] 完成 {i} 轮...")
+
+    print("--- 🏁 对战结束 🏁 ---")
+    
+    total_rounds = num_rounds
+    p1_win_rate = (p1_wins / total_rounds) * 100
+    p2_win_rate = (p2_wins / total_rounds) * 100
+    draw_rate = (draws / total_rounds) * 100
+    
+    return p1_wins, p2_wins, draws, p1_win_rate, p2_win_rate, draw_rate
+
+# ==========================================
+# V. 主程序执行
+# ==========================================
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("           Robocon AI 对战系统 (修复版)")
+    print("          A* Bot vs AlphaBeta Bot")
+    print("=" * 60)
+    
+    # 配置 Bots
+    ab_bot = AlphaBetaBot(depth=3) 
+    a_star_bot = AStarBot()
+    
+    # 为了演示，减少轮数以加快速度（完整测试建议500轮）
+    NUM_ROUNDS = 50
+    
+    print(f"对战轮数: {NUM_ROUNDS} 轮")
+    print(f"A* Bot (Player 1): 单步启发式搜索")
+    print(f"AlphaBeta Bot (Player -1): 深度 {ab_bot.search_depth}")
+    print("\n注意：AlphaBeta搜索深度为3，需要一定计算时间")
+    print("     请耐心等待对战结果...")
+    print()
+    
+    # 运行对战
+    start_time = time.time()
+    p1_wins, p2_wins, draws, p1_win_rate, p2_win_rate, draw_rate = run_duel(
+        bot1=a_star_bot,  # Player 1: A* Bot
+        bot2=ab_bot,      # Player -1: AlphaBeta Bot
+        num_rounds=NUM_ROUNDS
+    )
+    end_time = time.time()
+    
+    # --- 输出结果 ---
+    print("\n" + "="*60)
+    print("🏆 最终对战结果 (基于 Robocon 简化规则) 🏆")
+    print("="*60)
+    print(f"总回合数: {NUM_ROUNDS}")
+    print(f"总耗时: {end_time - start_time:.2f} 秒")
+    print("-" * 60)
+    print(f"A* Bot (Player 1) 获胜次数: {p1_wins}")
+    print(f"AlphaBeta Bot (Player -1) 获胜次数: {p2_wins}")
+    print(f"平局次数: {draws}")
+    print("-" * 60)
+    print(f"A* Bot (Player 1) 胜率: {p1_win_rate:.2f}%")
+    print(f"AlphaBeta Bot (Player -1) 胜率: {p2_win_rate:.2f}%")
+    print(f"平局率: {draw_rate:.2f}%")
+    print("="*60)
+    
+    # 打印简要分析
+    print("\n简要分析:")
+    if p1_win_rate > p2_win_rate:
+        print("✅ A* Bot 表现更优")
+        print("   优势: 更注重得分和时间效率")
+    elif p2_win_rate > p1_win_rate:
+        print("✅ AlphaBeta Bot 表现更优")
+        print("   优势: 深度搜索，更注重威胁评估")
+    else:
+        print("🤝 双方表现相当")
+    
+    print("\n游戏规则:")
+    print("- 胜利条件: 达成绝对胜利 (一整行/列/对角线且包含R2-KFS)")
+    print("- 时间限制: 180秒/玩家")
+    print("- 资源: 5个R1-KFS, 5个R2-KFS, 3个武器")
+    print("- 评分: R1/R2在不同层有不同分数")
